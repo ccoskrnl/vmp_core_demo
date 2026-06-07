@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="vmp_core/vmp_core.vcxproj" Id="7741a01f-c3e0-46a4-93e9-9add0a2ac3c3" />
+</Solution>
