@@ -143,9 +143,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="bytecode_encoder.h" />
-    <ClInclude Include="dispatch.h" />
     <ClInclude Include="handlers.h" />
-    <ClInclude Include="operand_decrypt.h" />
     <ClInclude Include="vmp_core.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

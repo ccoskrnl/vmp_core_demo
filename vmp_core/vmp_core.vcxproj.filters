@@ -26,13 +26,7 @@
     <ClInclude Include="vmp_core.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="dispatch.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
     <ClInclude Include="handlers.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
-    <ClInclude Include="operand_decrypt.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

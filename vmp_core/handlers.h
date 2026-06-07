@@ -1,512 +1,455 @@
 #pragma once
 // ============================================================================
-// Handler Implementations
+// Handler Implementations - Direct Threading Pattern
 // ============================================================================
-// Each handler implements one virtual instruction. These mirror what you'd
-// see in a real VMProtect 2 disassembly when you've identified handler
-// routines by their dispatch patterns.
+// In VMProtect 2, each handler is native x64 code that:
+//   1. Performs its operation (stack/register/memory/arithmetic)
+//   2. Ends with calc_jmp code (direct threading - no central dispatch loop)
 //
-// Key patterns to recognize in reverse engineering:
-//   - Stack operations: MOV [RBP+off], reg / MOV reg, [RBP+off]
-//   - Operand fetch: MOVZX reg, byte [RSI]; ADD RSI, 1
-//   - Key update: XOR RBX, reg; ROL RBX, imm; etc.
-//   - Dispatch: MOV reg, [R12 + opcode*8]; JMP reg
+// The calc_jmp code at the end of each handler:
+//   movzx eax, byte [rsi]    ; read next opcode
+//   lea   rsi, [rsi+1]       ; advance VIP
+//   mov   rdx, [r12+rax*8]   ; fetch handler entry
+//   xor   rdx, <key>         ; decrypt handler entry
+//   xor   rbx, rax           ; update rolling key
+//   jmp   rdx                ; dispatch to next handler
+//
+// This means there is NO central dispatch loop in real VMP.
+// Each handler directly jumps to the next one.
+//
+// For our simulation, each handler calls calc_jmp() at the end.
 // ============================================================================
 
-#include "dispatch.h"
+#include "vmp_core.h"
 
 namespace vmp {
 
-// ============================================================================
-// Register all handlers into the table
-// ============================================================================
-inline void register_all_handlers(HandlerTable& table) {
+    // ============================================================================
+    // Helper: read operand from VIP (inline in each handler for realism)
+    // ============================================================================
+    // In real VMP, operand reading is done with MOVZX/MOV instructions
+    // from [RSI] with various sizes, followed by transform decryption.
 
-    // ========================================================================
-    // HALT - Stop VM execution
-    // ========================================================================
-    table.register_handler(OP_HALT, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        engine.halt();
-        return false;
-    });
+    // ============================================================================
+    // Register all handlers into the table
+    // ============================================================================
+    inline void register_all_handlers(HandlerTable& table) {
 
-    // ========================================================================
-    // NOP
-    // ========================================================================
-    table.register_handler(OP_NOP, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        return true;
-    });
+        // ========================================================================
+        // HALT - Stop VM execution
+        // In real VMP: restores context via vm_exit
+        // ========================================================================
+        table.register_handler(OP_HALT, [](
+            VMEngine& engine, VMContext& ctx) {
+                // vm_exit: stop VM, restore native context
+                engine.vm_exit(ctx);
+                // No calc_jmp - VM execution ends here
+            });
 
-    // ========================================================================
-    // PUSH IMM - Load immediate value onto virtual stack
-    // ========================================================================
+        // ========================================================================
+        // NOP
+        // ========================================================================
+        table.register_handler(OP_NOP, [](
+            VMEngine& engine, VMContext& ctx) {
+                // End with calc_jmp (direct threading)
+                calc_jmp(engine, ctx);
+            });
 
-    // PUSH IMM8:  push 8-bit immediate (sign-extended to 64)
-    table.register_handler(OP_PUSH_IMM8, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t imm = static_cast<int64_t>(static_cast<int8_t>(reader.read_u8()));
-        ctx.push64(imm);
-        return true;
-    });
+        // ========================================================================
+        // PUSH IMM variants
+        // In real VMP: MOVZX RAX, byte/word/dword [RSI]; transforms; push
+        // Each PUSH variant has its own handler with unique transform chain
+        // ========================================================================
 
-    // PUSH IMM16
-    table.register_handler(OP_PUSH_IMM16, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t imm = static_cast<int64_t>(static_cast<int16_t>(reader.read_u16()));
-        ctx.push64(imm);
-        return true;
-    });
+        // PUSH IMM8 - variant 1 (standard)
+        table.register_handler(OP_PUSH_IMM8, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint64_t imm = static_cast<int64_t>(static_cast<int8_t>(reader.read_u8()));
+                ctx.push64(imm);
+                calc_jmp(engine, ctx);
+            });
 
-    // PUSH IMM32
-    table.register_handler(OP_PUSH_IMM32, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t imm = static_cast<int64_t>(static_cast<int32_t>(reader.read_u32()));
-        ctx.push64(imm);
-        return true;
-    });
+        // PUSH IMM16
+        table.register_handler(OP_PUSH_IMM16, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint64_t imm = static_cast<int64_t>(static_cast<int16_t>(reader.read_u16()));
+                ctx.push64(imm);
+                calc_jmp(engine, ctx);
+            });
 
-    // PUSH IMM64
-    table.register_handler(OP_PUSH_IMM64, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t imm = reader.read_u64();
-        ctx.push64(imm);
-        return true;
-    });
+        // PUSH IMM32
+        table.register_handler(OP_PUSH_IMM32, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint64_t imm = static_cast<int64_t>(static_cast<int32_t>(reader.read_u32()));
+                ctx.push64(imm);
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // POP - Discard top of stack
-    // ========================================================================
-    table.register_handler(OP_POP, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        ctx.pop64();
-        return true;
-    });
+        // PUSH IMM64 - has two handler variants (demonstrates polymorphism)
+        // Variant 1: standard read + push
+        table.register_handler(OP_PUSH_IMM64, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint64_t imm = reader.read_u64();
+                ctx.push64(imm);
+                calc_jmp(engine, ctx);
+            });
+        // Variant 2: same logic, different native code (in real VMP, different
+        // register allocation, different instruction ordering, different junk code)
+        table.register_handler(OP_PUSH_IMM64, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint64_t imm = reader.read_u64();
+                ctx.vsp -= 8;
+                *reinterpret_cast<uint64_t*>(ctx.vsp) = imm;
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // DUP - Duplicate top of stack
-    // ========================================================================
-    table.register_handler(OP_DUP, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t val = ctx.read_vsp<uint64_t>(0);
-        ctx.push64(val);
-        return true;
-    });
+        // ========================================================================
+        // POP
+        // ========================================================================
+        table.register_handler(OP_POP, [](
+            VMEngine& engine, VMContext& ctx) {
+                ctx.pop64();
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // LREG - Load scratch register onto stack
-    // Operand: register index (1 byte)
-    // Stack effect: push(regs[index])
-    // ========================================================================
-    table.register_handler(OP_LREG, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint8_t reg_idx = reader.read_u8();
-        uint64_t value = ctx.regs[reg_idx];
-        ctx.push64(value);
-        return true;
-    });
+        // DUP
+        table.register_handler(OP_DUP, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t val = ctx.read_vsp<uint64_t>(0);
+                ctx.push64(val);
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // SREG - Store top of stack into scratch register
-    // Operand: register index (1 byte)
-    // Stack effect: regs[index] = pop()
-    // ========================================================================
-    table.register_handler(OP_SREG, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint8_t reg_idx = reader.read_u8();
-        ctx.regs[reg_idx] = ctx.pop64();
-        return true;
-    });
+        // ========================================================================
+        // LREG - Load scratch register onto stack
+        // In real VMP: MOV RAX, [RDI+offset]; PUSH RAX
+        // ========================================================================
+        table.register_handler(OP_LREG, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint8_t idx = reader.read_u8();
+                ctx.push64(ctx.regs[idx]);
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // LCONST - Load constant from bytecode into scratch register
-    // Operand: register index (1 byte) + immediate value (size varies)
-    // ========================================================================
-    table.register_handler(OP_LCONST, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint8_t reg_idx = reader.read_u8();
-        uint64_t value = reader.read_u64();  // full 64-bit constant
-        ctx.regs[reg_idx] = value;
-        return true;
-    });
+        // SREG - Store into scratch register
+        // In real VMP: POP RAX; MOV [RDI+offset], RAX
+        table.register_handler(OP_SREG, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint8_t idx = reader.read_u8();
+                ctx.regs[idx] = ctx.pop64();
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // Memory Load operations
-    // Stack effect: addr = pop(); push(mem[addr])
-    // ========================================================================
+        // LCONST - Load constant into scratch register
+        table.register_handler(OP_LCONST, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint8_t idx = reader.read_u8();
+                uint64_t val = reader.read_u64();
+                ctx.regs[idx] = val;
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_LD8, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t addr = ctx.pop64();
-        uint8_t val = *reinterpret_cast<const uint8_t*>(addr);
-        ctx.push64(val);
-        return true;
-    });
+        // ========================================================================
+        // Memory operations
+        // In real VMP: POP RAX (address); MOVZX/POP value; PUSH result
+        // ========================================================================
 
-    table.register_handler(OP_LD16, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t addr = ctx.pop64();
-        uint16_t val = *reinterpret_cast<const uint16_t*>(addr);
-        ctx.push64(val);
-        return true;
-    });
+        table.register_handler(OP_LD8, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t addr = ctx.pop64();
+                ctx.push64(*reinterpret_cast<const uint8_t*>(addr));
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_LD16, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t addr = ctx.pop64();
+                ctx.push64(*reinterpret_cast<const uint16_t*>(addr));
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_LD32, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t addr = ctx.pop64();
+                ctx.push64(*reinterpret_cast<const uint32_t*>(addr));
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_LD64, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t addr = ctx.pop64();
+                ctx.push64(*reinterpret_cast<const uint64_t*>(addr));
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_LD32, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t addr = ctx.pop64();
-        uint32_t val = *reinterpret_cast<const uint32_t*>(addr);
-        ctx.push64(val);
-        return true;
-    });
+        table.register_handler(OP_ST8, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t val = ctx.pop64(); uint64_t addr = ctx.pop64();
+                *reinterpret_cast<uint8_t*>(addr) = (uint8_t)val;
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_ST16, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t val = ctx.pop64(); uint64_t addr = ctx.pop64();
+                *reinterpret_cast<uint16_t*>(addr) = (uint16_t)val;
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_ST32, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t val = ctx.pop64(); uint64_t addr = ctx.pop64();
+                *reinterpret_cast<uint32_t*>(addr) = (uint32_t)val;
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_ST64, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t val = ctx.pop64(); uint64_t addr = ctx.pop64();
+                *reinterpret_cast<uint64_t*>(addr) = val;
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_LD64, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t addr = ctx.pop64();
-        uint64_t val = *reinterpret_cast<const uint64_t*>(addr);
-        ctx.push64(val);
-        return true;
-    });
+        // ========================================================================
+        // Arithmetic - push result + RFLAGS
+        // In real VMP: POP RAX, POP RCX, compute, PUSH result, PUSHF
+        // Each arithmetic op can have multiple handler variants.
+        // ========================================================================
 
-    // ========================================================================
-    // Memory Store operations
-    // Stack effect: val = pop(); addr = pop(); mem[addr] = val
-    // ========================================================================
+        // ADD - two variants (demonstrates handler polymorphism)
+        table.register_handler(OP_ADD, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t b = ctx.pop64(), a = ctx.pop64();
+                uint64_t result = a + b;
+                ctx.push64(result);
+                ctx.push64(compute_flags(a, b, result, false).raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_ADD, [](
+            VMEngine& engine, VMContext& ctx) {
+                // Variant 2: uses VSP-relative access instead of pop/push
+                uint64_t b = ctx.read_vsp<uint64_t>(0);
+                uint64_t a = ctx.read_vsp<uint64_t>(8);
+                ctx.vsp += 8; // pop one, overwrite the other
+                uint64_t result = a + b;
+                *reinterpret_cast<uint64_t*>(ctx.vsp) = result;
+                ctx.push64(compute_flags(a, b, result, false).raw);
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_ST8, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t val  = ctx.pop64();
-        uint64_t addr = ctx.pop64();
-        *reinterpret_cast<uint8_t*>(addr) = static_cast<uint8_t>(val);
-        return true;
-    });
+        table.register_handler(OP_SUB, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t b = ctx.pop64(), a = ctx.pop64();
+                uint64_t result = a - b;
+                ctx.push64(result);
+                ctx.push64(compute_flags(a, b, result, true).raw);
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_ST16, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t val  = ctx.pop64();
-        uint64_t addr = ctx.pop64();
-        *reinterpret_cast<uint16_t*>(addr) = static_cast<uint16_t>(val);
-        return true;
-    });
+        table.register_handler(OP_MUL, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t b = ctx.pop64(), a = ctx.pop64();
+                uint64_t result = a * b;
+                VFlags f{}; f.raw = 0x2;
+                ctx.push64(result);
+                ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_ST32, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t val  = ctx.pop64();
-        uint64_t addr = ctx.pop64();
-        *reinterpret_cast<uint32_t*>(addr) = static_cast<uint32_t>(val);
-        return true;
-    });
+        table.register_handler(OP_AND, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t b = ctx.pop64(), a = ctx.pop64();
+                uint64_t result = a & b;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_OR, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t b = ctx.pop64(), a = ctx.pop64();
+                uint64_t result = a | b;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_XOR, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t b = ctx.pop64(), a = ctx.pop64();
+                uint64_t result = a ^ b;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_NOT, [](
+            VMEngine& engine, VMContext& ctx) {
+                ctx.push64(~ctx.pop64());
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_NEG, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t a = ctx.pop64();
+                uint64_t result = (uint64_t)(-(int64_t)a);
+                VFlags f{}; f.raw = 0x2;
+                f.CF = (a != 0); f.ZF = (result == 0);
+                f.SF = (result & 0x8000000000000000ULL) != 0;
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_SHL, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t cnt = ctx.pop64(), a = ctx.pop64();
+                uint8_t c = cnt & 63;
+                uint64_t result = c < 64 ? (a << c) : 0;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                if (c > 0 && c <= 64) f.CF = (a >> (64 - c)) & 1;
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_SHR, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t cnt = ctx.pop64(), a = ctx.pop64();
+                uint8_t c = cnt & 63;
+                uint64_t result = c < 64 ? (a >> c) : 0;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                if (c > 0 && c <= 64) f.CF = (a >> (c - 1)) & 1;
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_INC, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t a = ctx.pop64(), result = a + 1;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                f.OF = (a == 0x7FFFFFFFFFFFFFFFULL);
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_DEC, [](
+            VMEngine& engine, VMContext& ctx) {
+                uint64_t a = ctx.pop64(), result = a - 1;
+                VFlags f{}; f.raw = 0x2;
+                f.ZF = (result == 0); f.SF = (result & 0x8000000000000000ULL) != 0;
+                f.OF = (a == 0x8000000000000000ULL);
+                ctx.push64(result); ctx.push64(f.raw);
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_ST64, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t val  = ctx.pop64();
-        uint64_t addr = ctx.pop64();
-        *reinterpret_cast<uint64_t*>(addr) = val;
-        return true;
-    });
+        // ========================================================================
+        // PUSHF / POPF
+        // ========================================================================
+        table.register_handler(OP_PUSHF, [](
+            VMEngine& engine, VMContext& ctx) {
+                ctx.push64(ctx.rflags);
+                calc_jmp(engine, ctx);
+            });
+        table.register_handler(OP_POPF, [](
+            VMEngine& engine, VMContext& ctx) {
+                ctx.rflags = ctx.pop64();
+                calc_jmp(engine, ctx);
+            });
 
-    // ========================================================================
-    // Arithmetic Operations
-    // Stack effect: b = pop(); a = pop(); push(result); push(flags)
-    // This is critical: VMP pushes BOTH result AND RFLAGS onto the stack.
-    // This is a key fingerprint for identifying VM arithmetic in disassembly.
-    // ========================================================================
+        // ========================================================================
+        // Control Flow
+        // ========================================================================
 
-    table.register_handler(OP_ADD, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t b = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint64_t result = a + b;
-        VFlags flags = compute_flags(a, b, result, false, true);
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+        // JMP - unconditional relative jump
+        table.register_handler(OP_JMP, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                int32_t offset = (int32_t)reader.read_u32();
+                ctx.vip += offset;
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_SUB, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t b = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint64_t result = a - b;
-        VFlags flags = compute_flags(a, b, result, true, true);
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+        // JCC - conditional jump
+        table.register_handler(OP_JCC, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                uint8_t cc = reader.read_u8();
+                int32_t offset = (int32_t)reader.read_u32();
 
-    table.register_handler(OP_MUL, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t b = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        // Unsigned multiply, low 64 bits
-        uint64_t result = a * b;
-        VFlags flags{};
-        flags.raw = 0x2;
-        // CF and OF are set if upper 64 bits of 128-bit result are non-zero
-        // For simplicity, we don't compute the full 128-bit result here.
-        // In real VMP: MUL sets CF=OF=(high_half != 0)
-        flags.CF = 0;  // simplified
-        flags.OF = 0;
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+                VFlags f; f.raw = ctx.rflags;
+                bool take = false;
+                switch (cc) {
+                case CC_O:   take = f.OF; break;
+                case CC_NO:  take = !f.OF; break;
+                case CC_B:   take = f.CF; break;
+                case CC_NB:  take = !f.CF; break;
+                case CC_Z:   take = f.ZF; break;
+                case CC_NZ:  take = !f.ZF; break;
+                case CC_BE:  take = f.CF || f.ZF; break;
+                case CC_NBE: take = !f.CF && !f.ZF; break;
+                case CC_S:   take = f.SF; break;
+                case CC_NS:  take = !f.SF; break;
+                case CC_L:   take = f.SF != f.OF; break;
+                case CC_NL:  take = f.SF == f.OF; break;
+                case CC_LE:  take = f.ZF || (f.SF != f.OF); break;
+                case CC_NLE: take = !f.ZF && (f.SF == f.OF); break;
+                case CC_P:   take = f.PF; break;
+                case CC_NP:  take = !f.PF; break;
+                }
+                if (take) ctx.vip += offset;
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_AND, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t b = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint64_t result = a & b;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        flags.CF = 0;
-        flags.OF = 0;
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+        // CALL - push return address, jump
+        table.register_handler(OP_CALL, [](
+            VMEngine& engine, VMContext& ctx) {
+                BytecodeReader reader(ctx, *engine.operand_chain());
+                int32_t offset = (int32_t)reader.read_u32();
+                ctx.push64(ctx.vip);  // return address
+                ctx.vip += offset;
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_OR, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t b = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint64_t result = a | b;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        flags.CF = 0;
-        flags.OF = 0;
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+        // RET - pop return address
+        table.register_handler(OP_RET, [](
+            VMEngine& engine, VMContext& ctx) {
+                ctx.vip = ctx.pop64();
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_XOR, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t b = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint64_t result = a ^ b;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        flags.CF = 0;
-        flags.OF = 0;
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+        // ========================================================================
+        // Special
+        // ========================================================================
+        table.register_handler(OP_READ_KEY, [](
+            VMEngine& engine, VMContext& ctx) {
+                ctx.push64(ctx.rolling_key);
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_NOT, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t a = ctx.pop64();
-        uint64_t result = ~a;
-        ctx.push64(result);
-        // NOT doesn't affect flags in x86
-        return true;
-    });
+        // LREGS - push all scratch registers
+        table.register_handler(OP_LREGS, [](
+            VMEngine& engine, VMContext& ctx) {
+                for (int i = kScratchRegCount - 1; i >= 0; --i)
+                    ctx.push64(ctx.regs[i]);
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_NEG, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t a = ctx.pop64();
-        uint64_t result = static_cast<uint64_t>(-static_cast<int64_t>(a));
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.CF = (a != 0);
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
+        // SREGS - pop all scratch registers
+        table.register_handler(OP_SREGS, [](
+            VMEngine& engine, VMContext& ctx) {
+                for (size_t i = 0; i < kScratchRegCount; ++i)
+                    ctx.regs[i] = ctx.pop64();
+                calc_jmp(engine, ctx);
+            });
 
-    table.register_handler(OP_SHL, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t count = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint8_t c = count & 63;
-        uint64_t result = (c < 64) ? (a << c) : 0;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        // CF = last bit shifted out
-        if (c > 0 && c <= 64) {
-            flags.CF = (a >> (64 - c)) & 1;
-        }
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
-
-    table.register_handler(OP_SHR, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t count = ctx.pop64();
-        uint64_t a = ctx.pop64();
-        uint8_t c = count & 63;
-        uint64_t result = (c < 64) ? (a >> c) : 0;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        if (c > 0 && c <= 64) {
-            flags.CF = (a >> (c - 1)) & 1;
-        }
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
-
-    table.register_handler(OP_INC, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t a = ctx.pop64();
-        uint64_t result = a + 1;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        flags.OF = (a == 0x7FFFFFFFFFFFFFFFULL);
-        // INC doesn't affect CF in x86
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
-
-    table.register_handler(OP_DEC, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t a = ctx.pop64();
-        uint64_t result = a - 1;
-        VFlags flags{};
-        flags.raw = 0x2;
-        flags.ZF = (result == 0);
-        flags.SF = (result & 0x8000000000000000ULL) != 0;
-        flags.OF = (a == 0x8000000000000000ULL);
-        ctx.push64(result);
-        ctx.push64(flags.raw);
-        return true;
-    });
-
-    // ========================================================================
-    // PUSHF / POPF - RFLAGS management
-    // ========================================================================
-
-    table.register_handler(OP_PUSHF, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        ctx.push64(ctx.rflags);
-        return true;
-    });
-
-    table.register_handler(OP_POPF, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        ctx.rflags = ctx.pop64();
-        return true;
-    });
-
-    // ========================================================================
-    // Control Flow
-    // ========================================================================
-
-    // JMP: unconditional jump. VIP = popped address from stack.
-    // In some VMP variants, the jump target is an encrypted operand, not a
-    // stack value. We support both patterns.
-    table.register_handler(OP_JMP, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        // Read encrypted offset from bytecode (relative to current VIP)
-        int32_t offset = static_cast<int32_t>(reader.read_u32());
-        ctx.vip += offset;
-        return true;
-    });
-
-    // JCC: conditional jump
-    // Operand: condition code (1 byte) + relative offset (4 bytes)
-    table.register_handler(OP_JCC, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint8_t cc = reader.read_u8();
-        int32_t offset = static_cast<int32_t>(reader.read_u32());
-
-        bool take = false;
-        VFlags f;
-        f.raw = ctx.rflags;
-
-        switch (cc) {
-        case CC_O:   take = f.OF; break;
-        case CC_NO:  take = !f.OF; break;
-        case CC_B:   take = f.CF; break;
-        case CC_NB:  take = !f.CF; break;
-        case CC_Z:   take = f.ZF; break;
-        case CC_NZ:  take = !f.ZF; break;
-        case CC_BE:  take = f.CF || f.ZF; break;
-        case CC_NBE: take = !f.CF && !f.ZF; break;
-        case CC_S:   take = f.SF; break;
-        case CC_NS:  take = !f.SF; break;
-        case CC_L:   take = f.SF != f.OF; break;
-        case CC_NL:  take = f.SF == f.OF; break;
-        case CC_LE:  take = f.ZF || (f.SF != f.OF); break;
-        case CC_NLE: take = !f.ZF && (f.SF == f.OF); break;
-        case CC_P:   take = f.PF; break;
-        case CC_NP:  take = !f.PF; break;
-        }
-
-        if (take) {
-            ctx.vip += offset;
-        }
-        return true;
-    });
-
-    // CALL: push current VIP, then jump
-    table.register_handler(OP_CALL, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        uint64_t return_vip = ctx.vip;  // VIP already advanced past operands
-        int32_t offset = static_cast<int32_t>(reader.read_u32());
-        ctx.push64(return_vip);
-        ctx.vip += offset;
-        return true;
-    });
-
-    // RET: pop VIP
-    table.register_handler(OP_RET, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        ctx.vip = ctx.pop64();
-        return true;
-    });
-
-    // ========================================================================
-    // Special: READ_KEY - push current rolling key onto stack
-    // Used in key-dependent computations (anti-analysis)
-    // ========================================================================
-    table.register_handler(OP_READ_KEY, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        ctx.push64(ctx.rolling_key);
-        return true;
-    });
-
-    // ========================================================================
-    // SREGS / LREGS - bulk register save/restore
-    // These push/pop all scratch registers in a single instruction.
-    // ========================================================================
-
-    // LREGS: push all scratch registers onto stack
-    table.register_handler(OP_LREGS, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        // Push registers in reverse order (like PUSHAD)
-        for (int i = kScratchRegCount - 1; i >= 0; --i) {
-            ctx.push64(ctx.regs[i]);
-        }
-        return true;
-    });
-
-    // SREGS: pop all scratch registers from stack
-    table.register_handler(OP_SREGS, [](
-        VMEngine& engine, BytecodeReader& reader, VMContext& ctx) -> bool {
-        // Pop registers in forward order (reverse of LREGS push order)
-        for (size_t i = 0; i < kScratchRegCount; ++i) {
-            ctx.regs[i] = ctx.pop64();
-        }
-        return true;
-    });
-}
+        // VMEXIT - explicit VM exit
+        table.register_handler(OP_VMEXIT, [](
+            VMEngine& engine, VMContext& ctx) {
+                engine.vm_exit(ctx);
+                // No calc_jmp - VM execution ends
+            });
+    }
 
 } // namespace vmp
+
+
+

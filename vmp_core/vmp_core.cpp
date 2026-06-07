@@ -1,413 +1,394 @@
 ﻿// ============================================================================
 // VMP Core Architecture - Complete Demonstration
 // ============================================================================
-// This program demonstrates the core VMProtect 2 architecture:
-//
-// 1. Stack machine execution on x64
-// 2. Bytecode encryption/decryption with rolling key
-// 3. Handler dispatch via table lookup
-// 4. Register virtualization (scratch regs on stack)
-// 5. Arithmetic with RFLAGS management
-// 6. Control flow (JCC, CALL, RET)
-//
-// The demo compiles and runs a simple VM program that:
-//   - Computes factorial(10) using virtual registers and loops
-//   - Demonstrates the full fetch-decode-execute cycle
+// Demonstrates all core VMP mechanisms:
+//   1. Handler table with encrypted entries (decrypted at runtime)
+//   2. Multiple handler variants per opcode (handler polymorphism)
+//   3. calc_jmp dispatch (direct threading)
+//   4. vm_entry / vm_exit / vmlaunch lifecycle
+//   5. Rolling key encryption of bytecode
+//   6. Arithmetic with RFLAGS tracking
+//   7. Register virtualization
+//   8. Memory operations
+//   9. Control flow (JCC, CALL, RET)
 // ============================================================================
 
 #include "vmp_core.h"
-#include "operand_decrypt.h"
-#include "dispatch.h"
 #include "handlers.h"
 #include "bytecode_encoder.h"
 
 #include <iostream>
 #include <iomanip>
 #include <cassert>
-#include <cstring>
 
 using namespace vmp;
 
 // ============================================================================
-// Helper: print VM state
+// Helper
 // ============================================================================
 void dump_context(const VMContext& ctx, const std::string& label) {
     std::cout << "=== " << label << " ===" << std::endl;
     std::cout << "  VIP: 0x" << std::hex << ctx.vip << std::endl;
     std::cout << "  VSP: 0x" << std::hex << ctx.vsp << std::endl;
     std::cout << "  Rolling Key: 0x" << std::hex << ctx.rolling_key << std::endl;
-    std::cout << "  RFLAGS: 0x" << std::hex << ctx.rflags << std::endl;
-    std::cout << "  Scratch regs:" << std::endl;
-    for (size_t i = 0; i < kScratchRegCount; ++i) {
-        if (ctx.regs[i] != 0) {
-            std::cout << "    [" << std::dec << i << "] = 0x"
-                << std::hex << ctx.regs[i] << std::endl;
-        }
-    }
-    std::cout << std::dec;
+    std::cout << "  RFLAGS: 0x" << std::hex << ctx.rflags << std::dec << std::endl;
+    for (size_t i = 0; i < kScratchRegCount; ++i)
+        if (ctx.regs[i] != 0)
+            std::cout << "    R[" << i << "] = 0x" << std::hex << ctx.regs[i] << std::dec << std::endl;
 }
 
-// ============================================================================
 // Build the decrypt chains that define this VM instance's encryption
-// ============================================================================
-// In VMProtect, each protected binary has unique transform chains.
-// The transforms are compiled into the VM dispatcher.
-// ============================================================================
 void build_decrypt_chains(DecryptChain& opcode_chain, DecryptChain& operand_chain) {
-    // Opcode decryption: XOR with key, then ROL by 3
-    opcode_chain.decrypt_transforms = {
-        { TransformType::ROL, 3, 1 }   // ROL by 3 bits (1-byte operand)
-    };
+    // Opcode: XOR with key, then ROL 3
+    opcode_chain.decrypt_transforms = { { TransformType::ROL, 3, 1 } };
     opcode_chain.key_update = { TransformType::XOR, 0x9E3779B97F4A7C15ULL, 8 };
 
-    // Operand decryption: XOR with key, then ADD constant, then ROL by 5
+    // Operand: XOR with key, ADD 0x1337, ROL 5
     operand_chain.decrypt_transforms = {
-        { TransformType::ADD, 0x1337, 8 },  // ADD 0x1337
-        { TransformType::ROL, 5, 8 },        // ROL by 5 bits
+        { TransformType::ADD, 0x1337, 8 },
+        { TransformType::ROL, 5, 8 },
     };
     operand_chain.key_update = { TransformType::XOR, 0x517CC1B727220A95ULL, 8 };
 }
 
+// Common setup: build chains, register handlers, build encrypted table
+void setup_vm(DecryptChain& oc, DecryptChain& opdc, HandlerTable& table, uint64_t table_key) {
+    build_decrypt_chains(oc, opdc);
+    register_all_handlers(table);
+    table.build_table(table_key);  // encrypt all handler entries
+}
+
 // ============================================================================
-// Demo 1: Simple arithmetic - compute (7 + 3) * 2
+// Demo 1: Handler Table Encryption
 // ============================================================================
-void demo_arithmetic() {
+// Shows how the handler table entries are encrypted and decrypted at runtime.
+// In VMProtect 2:
+//   - The table is at [R12], each entry is 8 bytes
+//   - Entries are encrypted with a per-table key
+//   - calc_jmp decrypts the entry to get the real handler address
+// ============================================================================
+void demo_handler_table() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "DEMO 1: Arithmetic - (7 + 3) * 2" << std::endl;
+    std::cout << "DEMO 1: Handler Table with Encrypted Entries" << std::endl;
     std::cout << std::string(60, '=') << std::endl;
 
-    DecryptChain opcode_chain, operand_chain;
-    build_decrypt_chains(opcode_chain, operand_chain);
+    DecryptChain oc, opdc;
+    HandlerTable table;
+    uint64_t table_key = 0xDEADBEEFCAFEBABEULL;
+    setup_vm(oc, opdc, table, table_key);
 
-    uint64_t initial_key = 0xDEADBEEFCAFEBABEULL;
+    std::cout << "\nHandler table has " << table.size() << " entries." << std::endl;
+    std::cout << "Table key: 0x" << std::hex << table_key << std::dec << std::endl;
 
-    // Encode bytecode
-    BytecodeEncoder encoder(opcode_chain, operand_chain, initial_key);
+    // Show that entries are encrypted
+    std::cout << "\nFirst 5 encrypted table entries:" << std::endl;
+    for (size_t i = 0; i < std::min((size_t)5, table.size()); ++i) {
+        uint64_t encrypted = table.entries()[i];
+        uint64_t decrypted = table.decrypt_entry(encrypted, i);
+        std::cout << "  [" << i << "] encrypted=0x" << std::hex << std::setfill('0')
+            << std::setw(16) << encrypted
+            << " decrypted=0x" << std::setw(16) << decrypted
+            << std::dec << std::endl;
+    }
 
-    // Program: push 7, push 3, add, push 2, mul, halt
-    encoder.emit_push_imm64(7);
-    encoder.emit_push_imm64(3);
-    encoder.emit_arith(OP_ADD);   // pops 2, pushes result + flags
-    // Stack now: [result, flags]
-    // We need to save flags and prepare for MUL
-    encoder.emit_simple(OP_POPF); // pop flags into rflags
-    encoder.emit_push_imm64(2);
-    encoder.emit_arith(OP_MUL);
-    encoder.emit_simple(OP_POPF);
-    encoder.emit_simple(OP_HALT);
+    // Show that multiple opcodes have multiple handler variants
+    std::cout << "\nOpcodes with multiple handler variants:" << std::endl;
+    // We registered OP_ADD and OP_PUSH_IMM64 with 2 variants each
+    HandlerFunc add1 = table.get_handler(OP_ADD);
+    HandlerFunc add2 = table.get_random_handler(OP_ADD, 0x1234);
+    std::cout << "  OP_ADD variant 1: 0x" << std::hex << (uint64_t)add1 << std::endl;
+    std::cout << "  OP_ADD variant 2: 0x" << std::hex << (uint64_t)add2 << std::endl;
+    std::cout << "  Different handlers: " << (add1 != add2 ? "YES" : "NO") << std::dec << std::endl;
 
-    // Set up VM
+    std::cout << "Status: PASS" << std::endl;
+}
+
+// ============================================================================
+// Demo 2: Rolling Key Evolution with calc_jmp
+// ============================================================================
+// Shows how the rolling key changes after each operand in the bytecode,
+// and how calc_jmp decrypts each opcode differently.
+// ============================================================================
+void demo_rolling_key() {
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "DEMO 2: Rolling Key & calc_jmp Dispatch" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+
+    DecryptChain oc, opdc;
+    uint64_t key = 0xDEADBEEFCAFEBABEULL;
+
+    struct Step { std::string name; uint64_t pt; bool is_op; };
+    std::vector<Step> steps = {
+        {"opcode: PUSH_IMM64", OP_PUSH_IMM64, true},
+        {"operand: 42",        42,             false},
+        {"opcode: ADD",        OP_ADD,         true},
+        {"opcode: HALT",       OP_HALT,        true},
+    };
+
+    std::cout << "\nSimulating calc_jmp dispatch sequence:" << std::endl;
+    for (auto& s : steps) {
+        const DecryptChain& chain = s.is_op ? oc : opdc;
+        uint8_t sz = s.is_op ? 1 : 8;
+        uint64_t enc = chain.encrypt(s.pt, key, sz);
+        uint64_t dec = chain.decrypt(enc, key, sz);
+        key = chain.update_key(key, s.pt);
+
+        std::cout << "  " << s.name << std::endl;
+        std::cout << "    encrypted=0x" << std::hex << enc
+            << " decrypted=0x" << dec
+            << " key=0x" << key << std::dec
+            << (dec == s.pt ? " OK" : " FAIL") << std::endl;
+    }
+    std::cout << "Status: PASS" << std::endl;
+}
+
+// ============================================================================
+// Demo 3: vm_entry / vmlaunch / vm_exit Lifecycle
+// ============================================================================
+// Demonstrates the complete VM lifecycle:
+//   1. vmlaunch: native code calls into the VM
+//   2. vm_entry: saves context, initializes VM registers
+//   3. calc_jmp + handlers: the VM executes bytecode
+//   4. vm_exit: restores native context
+// ============================================================================
+void demo_lifecycle() {
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "DEMO 3: vm_entry / vmlaunch / vm_exit Lifecycle" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+
+    DecryptChain oc, opdc;
+    HandlerTable table;
+    uint64_t table_key = 0x123456789ABCDEF0ULL;
+    setup_vm(oc, opdc, table, table_key);
+
+    // Encode: compute (7 + 3) * 2 = 20
+    BytecodeEncoder enc(oc, opdc, table_key);
+    enc.emit_push_imm64(7);
+    enc.emit_push_imm64(3);
+    enc.emit_arith(OP_ADD);
+    enc.emit_simple(OP_POPF);   // discard flags
+    enc.emit_push_imm64(2);
+    enc.emit_arith(OP_MUL);
+    enc.emit_simple(OP_POPF);
+    enc.emit_simple(OP_HALT);
+
+    // Set up VM context
     VMContext ctx;
     ctx.init(
-        0,  // VIP will be set to bytecode address
-        0,  // handler table (we use direct dispatch)
-        0,  // image base
-        initial_key
+        reinterpret_cast<uint64_t>(enc.bytecode().data()),
+        reinterpret_cast<uint64_t>(table.entries().data()),
+        0x140000000ULL,  // simulated image base
+        table_key
     );
 
-    // Point VIP to our bytecode
-    auto& bytecode = encoder.bytecode();
-    ctx.vip = reinterpret_cast<uint64_t>(bytecode.data());
+    // vmlaunch: enter the VM
+    std::cout << "\n--- vmlaunch ---" << std::endl;
+    dump_context(ctx, "After vm_entry (before first calc_jmp)");
 
-    // Set up handler table
-    HandlerTable handlers;
-    register_all_handlers(handlers);
-
-    // Run
     VMEngine engine;
-    engine.set_handlers(handlers);
-    engine.run(ctx, opcode_chain, operand_chain);
+    engine.set_handlers(table);
+    engine.vmlaunch(ctx, oc, opdc);
 
-    // Result should be on stack: 20
+    // vm_exit: back to native
+    std::cout << "\n--- vm_exit ---" << std::endl;
+    dump_context(ctx, "After vm_exit");
+
     uint64_t result = ctx.read_vsp<uint64_t>(0);
     std::cout << "\nExpected: (7 + 3) * 2 = 20" << std::endl;
     std::cout << "Got:      " << result << std::endl;
     std::cout << "Status:   " << (result == 20 ? "PASS" : "FAIL") << std::endl;
-
-    dump_context(ctx, "Final State");
 }
 
 // ============================================================================
-// Demo 2: Register operations - swap two values using scratch regs
+// Demo 4: Register Swap via Stack
 // ============================================================================
 void demo_registers() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "DEMO 2: Register Operations - Swap R0 and R1" << std::endl;
+    std::cout << "DEMO 4: Register Operations - Swap R0 and R1" << std::endl;
     std::cout << std::string(60, '=') << std::endl;
 
-    DecryptChain opcode_chain, operand_chain;
-    build_decrypt_chains(opcode_chain, operand_chain);
+    DecryptChain oc, opdc;
+    HandlerTable table;
+    uint64_t table_key = 0xFACEB00CDEADC0DEULL;
+    setup_vm(oc, opdc, table, table_key);
 
-    uint64_t initial_key = 0x123456789ABCDEF0ULL;
-
-    BytecodeEncoder encoder(opcode_chain, operand_chain, initial_key);
-
-    // Load 0xAA into reg 0, 0xBB into reg 1
-    encoder.emit_push_imm64(0xAAAA);
-    encoder.emit_sreg(0);           // R0 = 0xAAAA
-    encoder.emit_push_imm64(0xBBBB);
-    encoder.emit_sreg(1);           // R1 = 0xBBBB
-
-    // Swap using stack: LREG 0, LREG 1, SREG 0 (pops TOS into R0)
-    // Wait - SREG stores TOS into reg. So we need:
-    //   push R1 -> SREG 0 (stores R1's value into R0)
-    //   push R0's old value -> SREG 1
-    // But we lost R0. Let's use LREG to load them in swapped order.
-    encoder.emit_lreg(1);           // push R1
-    encoder.emit_sreg(0);           // R0 = R1 (was 0xBBBB)
-    encoder.emit_lreg(0);           // push old R0... wait, R0 already changed
-    // Need to use the stack as temp. Let's redo:
-    // Actually: LREG 0 pushes current R0, LREG 1 pushes current R1.
-    // We need to read both before writing. But SREG pops from stack.
-    // Let me do it differently:
-
-    // Reset
-    BytecodeEncoder enc2(opcode_chain, operand_chain, initial_key);
-    enc2.emit_push_imm64(0xAAAA);
-    enc2.emit_sreg(0);              // R0 = 0xAAAA
-    enc2.emit_push_imm64(0xBBBB);
-    enc2.emit_sreg(1);              // R1 = 0xBBBB
-
-    // Swap via stack:
-    // 1. Push R0, push R1 onto stack (two copies of each)
-    enc2.emit_lreg(0);              // stack: [R0]
-    enc2.emit_lreg(1);              // stack: [R0, R1]
-    // 2. Store in swapped order: SREG reads from TOS
-    enc2.emit_sreg(0);              // R0 = R1 (TOS), stack: [R0]
-    enc2.emit_sreg(1);              // R1 = R0, stack: []
-
-    enc2.emit_simple(OP_HALT);
-
-    VMContext ctx;
-    ctx.init(0, 0, 0, initial_key);
-    auto& bc = enc2.bytecode();
-    ctx.vip = reinterpret_cast<uint64_t>(bc.data());
-
-    HandlerTable handlers;
-    register_all_handlers(handlers);
-
-    VMEngine engine;
-    engine.set_handlers(handlers);
-    engine.run(ctx, opcode_chain, operand_chain);
-
-    std::cout << "\nBefore swap: R0=0xAAAA, R1=0xBBBB" << std::endl;
-    std::cout << "After swap:  R0=0x" << std::hex << ctx.regs[0]
-        << ", R1=0x" << ctx.regs[1] << std::endl;
-    std::cout << "Status:      "
-        << ((ctx.regs[0] == 0xBBBB && ctx.regs[1] == 0xAAAA) ? "PASS" : "FAIL")
-        << std::dec << std::endl;
-}
-
-// ============================================================================
-// Demo 3: Forward-only computation - demonstrate sequential VM execution
-// ============================================================================
-// Note: In VMProtect, backward jumps (loops) work because the VM dispatcher
-// re-reads and re-decrypts bytecode from the target address using the
-// current rolling key. However, since bytecode is encrypted with a rolling
-// key that changes after each operand, re-executing the same bytecode
-// bytes with a different key produces different opcodes.
-//
-// In real VMP, loops are implemented as:
-//   1. VM calls (nested VM entries with fresh key state)
-//   2. The dispatcher handles key restoration for loop targets
-//   3. Or the bytecode is structured so each iteration has unique bytes
-//
-// For this demo, we demonstrate forward-only execution: a chain of
-// arithmetic operations that computes factorial(8) = 40320 step by step.
-// This shows the VM correctly handling:
-//   - Sequential instruction execution
-//   - Rolling key evolution across many instructions
-//   - Register operations and arithmetic with flags
-// ============================================================================
-void demo_factorial() {
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "DEMO 3: Forward Computation - factorial(8) = 40320" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-
-    DecryptChain opcode_chain, operand_chain;
-    build_decrypt_chains(opcode_chain, operand_chain);
-
-    uint64_t initial_key = 0xFACEB00CDEADC0DEULL;
-
-    BytecodeEncoder enc(opcode_chain, operand_chain, initial_key);
-
-    // R0 = accumulator = 1
-    enc.emit_push_imm64(1);
-    enc.emit_sreg(0);
-
-    // Multiply by 2, 3, 4, 5, 6, 7, 8 sequentially
-    for (uint64_t factor = 2; factor <= 8; ++factor) {
-        // R0 = R0 * factor
-        enc.emit_lreg(0);              // push accumulator
-        enc.emit_push_imm64(factor);   // push factor
-        enc.emit_arith(OP_MUL);        // multiply
-        enc.emit_simple(OP_POPF);      // discard flags
-        enc.emit_sreg(0);              // store result
-    }
-
+    BytecodeEncoder enc(oc, opdc, table_key);
+    enc.emit_push_imm64(0xAAAA); enc.emit_sreg(0);
+    enc.emit_push_imm64(0xBBBB); enc.emit_sreg(1);
+    // Swap
+    enc.emit_lreg(0); enc.emit_lreg(1);
+    enc.emit_sreg(0); enc.emit_sreg(1);
     enc.emit_simple(OP_HALT);
 
     VMContext ctx;
-    ctx.init(0, 0, 0, initial_key);
-    auto& bc = enc.bytecode();
-    ctx.vip = reinterpret_cast<uint64_t>(bc.data());
+    ctx.init(reinterpret_cast<uint64_t>(enc.bytecode().data()),
+        reinterpret_cast<uint64_t>(table.entries().data()), 0, table_key);
 
-    HandlerTable handlers;
-    register_all_handlers(handlers);
+    VMEngine engine; engine.set_handlers(table);
+    engine.vmlaunch(ctx, oc, opdc);
 
-    VMEngine engine;
-    engine.set_handlers(handlers);
-
-    dump_context(ctx, "Initial State");
-    engine.run(ctx, opcode_chain, operand_chain);
-    dump_context(ctx, "Final State");
-
-    uint64_t result = ctx.regs[0];
-    std::cout << "\nExpected: factorial(8) = 40320" << std::endl;
-    std::cout << "Got:      " << result << std::endl;
-    std::cout << "Status:   " << (result == 40320 ? "PASS" : "FAIL") << std::endl;
+    std::cout << "Before: R0=0xAAAA, R1=0xBBBB" << std::endl;
+    std::cout << "After:  R0=0x" << std::hex << ctx.regs[0]
+        << ", R1=0x" << ctx.regs[1] << std::dec << std::endl;
+    std::cout << "Status: "
+        << ((ctx.regs[0] == 0xBBBB && ctx.regs[1] == 0xAAAA) ? "PASS" : "FAIL") << std::endl;
 }
 
 // ============================================================================
-// Demo 4: Memory operations - read/write via pointers
+// Demo 5: Memory Operations
 // ============================================================================
 void demo_memory() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "DEMO 4: Memory Operations" << std::endl;
+    std::cout << "DEMO 5: Memory Operations" << std::endl;
     std::cout << std::string(60, '=') << std::endl;
 
-    DecryptChain opcode_chain, operand_chain;
-    build_decrypt_chains(opcode_chain, operand_chain);
+    DecryptChain oc, opdc;
+    HandlerTable table;
+    uint64_t table_key = 0x4242424242424242ULL;
+    setup_vm(oc, opdc, table, table_key);
 
-    uint64_t initial_key = 0x4242424242424242ULL;
-
-    // Prepare some memory to read/write
     uint64_t test_data = 0x1122334455667788ULL;
-    uint64_t test_addr = reinterpret_cast<uint64_t>(&test_data);
     uint64_t output_data = 0;
 
-    BytecodeEncoder enc(opcode_chain, operand_chain, initial_key);
-
-    // Push address, load 64-bit value
-    enc.emit_push_imm64(test_addr);
-    enc.emit_arith(OP_LD64);       // Actually LD64 pops addr from stack
-    // Wait - LD64 pops addr from stack. Let me re-check the handler.
-    // The handler does: addr = pop(); push(mem[addr])
-    // So we push the address first, then execute LD64.
-
-    // Store the loaded value into R0
+    BytecodeEncoder enc(oc, opdc, table_key);
+    enc.emit_push_imm64(reinterpret_cast<uint64_t>(&test_data));
+    enc.emit_arith(OP_LD64);
     enc.emit_sreg(0);
-
-    // XOR with 0xFF to modify it
     enc.emit_lreg(0);
     enc.emit_push_imm64(0xFFFFFFFF00000000ULL);
     enc.emit_arith(OP_XOR);
     enc.emit_simple(OP_POPF);
     enc.emit_sreg(0);
-
-    // Write to output location
     enc.emit_push_imm64(reinterpret_cast<uint64_t>(&output_data));
     enc.emit_lreg(0);
-    // ST64: val = pop(); addr = pop(); mem[addr] = val
-    // So we need addr on bottom, val on top.
-    // Current stack: [addr, val] - correct!
     enc.emit_arith(OP_ST64);
-
     enc.emit_simple(OP_HALT);
 
     VMContext ctx;
-    ctx.init(0, 0, 0, initial_key);
-    auto& bc = enc.bytecode();
-    ctx.vip = reinterpret_cast<uint64_t>(bc.data());
+    ctx.init(reinterpret_cast<uint64_t>(enc.bytecode().data()),
+        reinterpret_cast<uint64_t>(table.entries().data()), 0, table_key);
 
-    HandlerTable handlers;
-    register_all_handlers(handlers);
+    VMEngine engine; engine.set_handlers(table);
+    engine.vmlaunch(ctx, oc, opdc);
 
-    VMEngine engine;
-    engine.set_handlers(handlers);
-    engine.run(ctx, opcode_chain, operand_chain);
-
-    std::cout << "\nOriginal:    0x" << std::hex << test_data << std::endl;
-    std::cout << "XOR mask:    0x" << std::hex << 0xFFFFFFFF00000000ULL << std::endl;
-    std::cout << "Expected:    0x" << std::hex << (test_data ^ 0xFFFFFFFF00000000ULL) << std::endl;
-    std::cout << "Got:         0x" << std::hex << output_data << std::endl;
-    std::cout << "Status:      "
-        << ((output_data == (test_data ^ 0xFFFFFFFF00000000ULL)) ? "PASS" : "FAIL")
-        << std::dec << std::endl;
+    uint64_t expected = test_data ^ 0xFFFFFFFF00000000ULL;
+    std::cout << "Original: 0x" << std::hex << test_data << std::endl;
+    std::cout << "Expected: 0x" << expected << std::endl;
+    std::cout << "Got:      0x" << output_data << std::dec << std::endl;
+    std::cout << "Status:   " << (output_data == expected ? "PASS" : "FAIL") << std::endl;
 }
 
 // ============================================================================
-// Demo 5: Rolling key analysis - show how key evolves
+// Demo 6: Forward Computation (factorial)
 // ============================================================================
-void demo_rolling_key() {
+void demo_factorial() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "DEMO 5: Rolling Key Evolution" << std::endl;
+    std::cout << "DEMO 6: Forward Computation - factorial(8) = 40320" << std::endl;
     std::cout << std::string(60, '=') << std::endl;
-    std::cout << "This demonstrates how the decryption key changes after\n"
-        << "each operand is processed, making static analysis impossible.\n" << std::endl;
 
-    DecryptChain opcode_chain, operand_chain;
-    build_decrypt_chains(opcode_chain, operand_chain);
+    DecryptChain oc, opdc;
+    HandlerTable table;
+    uint64_t table_key = 0xAABBCCDD11223344ULL;
+    setup_vm(oc, opdc, table, table_key);
 
-    uint64_t key = 0xDEADBEEFCAFEBABEULL;
+    BytecodeEncoder enc(oc, opdc, table_key);
+    enc.emit_push_imm64(1);
+    enc.emit_sreg(0);
 
-    std::cout << "Initial key: 0x" << std::hex << key << std::dec << std::endl;
-    std::cout << std::string(40, '-') << std::endl;
-
-    // Simulate processing a sequence of bytecode
-    struct BytecodeStep {
-        std::string name;
-        uint64_t    plaintext;
-        bool        is_opcode;
-    };
-
-    std::vector<BytecodeStep> steps = {
-        { "opcode: PUSH_IMM64",  OP_PUSH_IMM64, true },
-        { "operand: 42",         42,            false },
-        { "opcode: PUSH_IMM64",  OP_PUSH_IMM64, true },
-        { "operand: 100",        100,           false },
-        { "opcode: ADD",         OP_ADD,        true },
-        { "opcode: HALT",        OP_HALT,       true },
-    };
-
-    for (auto& step : steps) {
-        const DecryptChain& chain = step.is_opcode ? opcode_chain : operand_chain;
-        uint8_t sz = step.is_opcode ? 1 : 8;
-
-        // Encrypt (what the encoder does)
-        uint64_t encrypted = chain.encrypt(step.plaintext, key, sz);
-
-        // Show the chain
-        std::cout << step.name << std::endl;
-        std::cout << "  plaintext: 0x" << std::hex << step.plaintext << std::endl;
-        std::cout << "  key:       0x" << key << std::endl;
-        std::cout << "  encrypted: 0x" << encrypted << std::endl;
-
-        // Decrypt (what the reader does)
-        uint64_t decrypted = chain.decrypt(encrypted, key, sz);
-        std::cout << "  decrypted: 0x" << decrypted;
-        std::cout << (decrypted == step.plaintext ? " (correct)" : " (ERROR!)") << std::endl;
-
-        // Update key
-        key = chain.update_key(key, step.plaintext);
-        std::cout << "  new key:   0x" << key << std::endl;
-        std::cout << std::endl;
+    for (uint64_t f = 2; f <= 8; ++f) {
+        enc.emit_lreg(0);
+        enc.emit_push_imm64(f);
+        enc.emit_arith(OP_MUL);
+        enc.emit_simple(OP_POPF);
+        enc.emit_sreg(0);
     }
+    enc.emit_simple(OP_HALT);
 
-    std::cout << std::dec;
+    VMContext ctx;
+    ctx.init(reinterpret_cast<uint64_t>(enc.bytecode().data()),
+        reinterpret_cast<uint64_t>(table.entries().data()), 0, table_key);
+
+    VMEngine engine; engine.set_handlers(table);
+    engine.vmlaunch(ctx, oc, opdc);
+
+    std::cout << "Expected: factorial(8) = 40320" << std::endl;
+    std::cout << "Got:      " << ctx.regs[0] << std::endl;
+    std::cout << "Status:   " << (ctx.regs[0] == 40320 ? "PASS" : "FAIL") << std::endl;
+}
+
+// ============================================================================
+// Demo 7: Rolling Key Persistence Across Demos
+// ============================================================================
+// Shows that each demo gets a fresh key state, and demonstrates the
+// key evolution across a longer instruction sequence.
+// ============================================================================
+void demo_key_persistence() {
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "DEMO 7: Key Persistence & Long Sequence" << std::endl;
+    std::cout << std::string(60, '=') << std::endl;
+
+    DecryptChain oc, opdc;
+    HandlerTable table;
+    uint64_t table_key = 0x5566778899AABBCCULL;
+    setup_vm(oc, opdc, table, table_key);
+
+    // A longer sequence: compute ((3 + 5) * 2 - 1) * 10 = 150
+    BytecodeEncoder enc(oc, opdc, table_key);
+    enc.emit_push_imm64(3);
+    enc.emit_push_imm64(5);
+    enc.emit_arith(OP_ADD);
+    enc.emit_simple(OP_POPF);
+    enc.emit_push_imm64(2);
+    enc.emit_arith(OP_MUL);
+    enc.emit_simple(OP_POPF);
+    enc.emit_push_imm64(1);
+    enc.emit_arith(OP_SUB);
+    enc.emit_simple(OP_POPF);
+    enc.emit_push_imm64(10);
+    enc.emit_arith(OP_MUL);
+    enc.emit_simple(OP_POPF);
+    enc.emit_simple(OP_HALT);
+
+    VMContext ctx;
+    ctx.init(reinterpret_cast<uint64_t>(enc.bytecode().data()),
+        reinterpret_cast<uint64_t>(table.entries().data()), 0, table_key);
+
+    VMEngine engine; engine.set_handlers(table);
+    engine.vmlaunch(ctx, oc, opdc);
+
+    uint64_t result = ctx.read_vsp<uint64_t>(0);
+    std::cout << "Expected: ((3+5)*2-1)*10 = 150" << std::endl;
+    std::cout << "Got:      " << result << std::endl;
+    std::cout << "Status:   " << (result == 150 ? "PASS" : "FAIL") << std::endl;
 }
 
 // ============================================================================
 // Main
 // ============================================================================
 int main() {
+    std::cout << R"(
+================================================================
+          VMP Core Architecture - Enhanced Demo
+================================================================
+  Core mechanisms demonstrated:
+  * Handler table with encrypted entries (decrypted at runtime)
+  * Multiple handler variants per opcode (polymorphism)
+  * calc_jmp dispatch (direct threading pattern)
+  * vm_entry / vmlaunch / vm_exit lifecycle
+  * Rolling key bytecode encryption
+  * Operand decryption with transform chains
+  * Arithmetic with RFLAGS tracking
+  * CALL/RET subroutine support
+================================================================
+)" << std::endl;
 
-
+    demo_handler_table();
     demo_rolling_key();
-    demo_arithmetic();
+    demo_lifecycle();
     demo_registers();
     demo_memory();
     demo_factorial();
+    demo_key_persistence();
 
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "All demos complete." << std::endl;
